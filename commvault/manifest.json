@@ -1,0 +1,40 @@
+{
+    "name": "CommVault",
+    "id": "commvault",
+    "version": "1.0.1",
+    "description": "The CommVault plugin fetches alerts with from CommVault Threat Analysis and pushes to Netskope CTE. The plugin supports sharing Indicators to CommVault via CommVault REST API..",
+    "patch_supported": false,
+    "configuration": [
+        {
+            "label": "Webservice URL",
+            "key": "webservice_url",
+            "type": "text",
+            "default": "http://<Webservice_FQDN>:81/SearchSvc/CVWebService.svc",
+            "mandatory": true,
+            "description": "CommVault Webservice URL which alerts are pushed to/pulled from For eg: 'http://cvwebservice.nam.contoso.com:81/SearchSvc/CVWebService.svc'"
+        },        {
+            "label": "CommVault REST API Authentication Token",
+            "key": "auth_token",
+            "type": "password",
+            "default": "",
+            "mandatory": true,
+            "description": "CommVault REST API authToken."
+        },
+        {
+            "label": "Initial Range (in days)",
+            "key": "days",
+            "type": "number",
+            "mandatory": true,
+            "default": 7,
+            "description": "Number of days to pull the data for the initial run."
+        }, 
+        {
+            "label": "Anomalous Event String Filter",
+            "key": "anomalous_eventcode_string",
+            "type": "text",
+            "mandatory": true,
+            "default": "69:59",
+            "description": "The Event Code String for amolaous events to be pulled from CommVault"
+        }
+    ]
+}
