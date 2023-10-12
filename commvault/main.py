@@ -19,9 +19,16 @@ from netskope.integrations.cte.models.business_rule import (
 
 MAX_PAGE_SIZE = 100
 MAX_PULL_PAGE_SIZE = 2000
-PLUGIN_NAME = "CTE CommVault Plugin"
+PLUGIN_NAME = "CommVault CTE Plugin"
 MAX_RETRY_COUNT = 4
 TIME_OUT = 30
+RE_DEL_HTML = re.compile(r"(<span[^>]*>(.+?)</span>)|(<.*?>)")
+RE_GET_LINK = re.compile(r"<a[^>]*href=(.+?)>.+?</a>")
+ANOMALOUS_EVENTCODE_STRINGS = {
+    "7:333": {"comments": RE_DEL_HTML, "extended_info": RE_GET_LINK},
+    "14:337": {"comments": RE_DEL_HTML, "extended_info": RE_GET_LINK},
+}
+
 
 COMMVAULT_TO_NETSCOPE_SEVERITY = {
     -1: SeverityType.UNKNOWN,
@@ -36,7 +43,6 @@ COMMVAULT_TO_NETSCOPE_SEVERITY = {
     8: SeverityType.CRITICAL,
     9: SeverityType.CRITICAL,
     10: SeverityType.CRITICAL,
-
 }
 
 
@@ -50,18 +56,21 @@ class CommVaultPlugin(PluginBase):
 
     def _validate_credentials(self, configuration: dict) -> ValidationResult:
         try:
-            base_url = configuration["webservice_url"].strip().strip("/")
+            base_url = configuration["commandcenter_url"].strip().strip("/")
+            headers = {
+                "authToken": configuration["auth_token"],
+                "Accept": "application/json",
+            }
             response = requests.get(
                 f"{base_url}/ApiToken/User",
-                headers={
-                    "authToken": configuration["auth_token"],
-                    "Accept": "application/json",
-                },
+                headers=headers,
                 proxies=self.proxy,
                 verify=self.ssl_validation,
             )
             if response.status_code == 200:
-                self.logger.info("Credentials validated successfully")
+                self.logger.info(
+                    f"{PLUGIN_NAME}: Credentials validated successfully"
+                )
                 return ValidationResult(
                     success=True, message="Validation successful."
                 )
@@ -167,15 +176,17 @@ class CommVaultPlugin(PluginBase):
             )
         response.raise_for_status()
 
-    def fetch_events(self, last_timestamp=None) -> tuple:
-
-        base_url = self.configuration["webservice_url"].strip().strip("/")
+    def fetch_events(self, from_time: datetime = None) -> tuple:
+        """
+        Fetches the events from Commvault REST API from from_time onwards
+        """
+        base_url = self.configuration["commandcenter_url"].strip().strip("/")
         params = {
             "level": 10,
             "showAnomalous": True,
         }
-        if last_timestamp:
-            params["fromTime"] = str(int(last_timestamp))
+        if from_time and isinstance(from_time, datetime):
+            params["fromTime"] = str(int(from_time.timestamp()))
         response = requests.get(
             f"{base_url}/Events",
             params=params,
@@ -190,12 +201,17 @@ class CommVaultPlugin(PluginBase):
         )
 
         if not response.get("commservEvents"):
-            self.logger.info("There are no events")
+            self.logger.info(
+                f"{PLUGIN_NAME}: No new events from {str(from_time)}"
+            )
             return []
 
         events = response.get("commservEvents")
-        #self.logger.info(f"Events: {str(events)}")
-        events = [d for d in events if d.get("eventCodeString") == "69:59"]
+        events = [
+            d
+            for d in events
+            if d.get("eventCodeString") in ANOMALOUS_EVENTCODE_STRINGS
+        ]
         events = sorted(events, key=lambda d: d.get("timeSource"))
         for event in events:
             try:
@@ -208,13 +224,15 @@ class CommVaultPlugin(PluginBase):
         return events
 
     def get_client_hostname(self, client_id: int) -> str:
-        "Get the hosotname from client properties"
-        base_url = self.configuration["webservice_url"].strip().strip("/")
-        response = requests.get(f"{base_url}/Client/{int(client_id)}",
+        "Get the hostname from client properties using client id"
+        base_url = self.configuration["commandcenter_url"].strip().strip("/")
+        response = requests.get(
+            f"{base_url}/Client/{int(client_id)}",
             params={},
             headers=self._get_headers(),
             proxies=self.proxy,
-            verify=self.ssl_validation,)
+            verify=self.ssl_validation,
+        )
         response = self.handle_status_code(
             response,
             "Error occurred in get_client_hostname()",
@@ -222,9 +240,9 @@ class CommVaultPlugin(PluginBase):
         )
         hostname = ""
         try:
-            hostname = response["clientProperties"][0]["client"]["clientEntity"][
-                "hostName"
-            ]
+            hostname = response["clientProperties"][0]["client"][
+                "clientEntity"
+            ]["hostName"]
         except KeyError as e:
             self.logger.error(
                 f"Exception while getting client hostname: {str(e)}"
@@ -233,47 +251,74 @@ class CommVaultPlugin(PluginBase):
 
     def pull(self):
         """Pull indicators from CommVault."""
-        indicators = []
-        base_url = self.configuration["webservice_url"]
-        self.logger.info(f"{PLUGIN_NAME}: Pulling indicators from {base_url} ")
-        if not self.last_run_at:
-            last_timestamp = (datetime.now() - timedelta(days=int(self.configuration["days"]))).timestamp()
-            self.logger.info(f"{PLUGIN_NAME} will run for the first time and pull events from: {str(last_timestamp)}")
-        else:
-            last_timestamp = int(self.last_run_at.timestamp()) 
-            self.logger.info(f"Pulling events from timestamp: {last_timestamp}")
         try:
-            for retry in range(MAX_RETRY_COUNT):
-                try:
-                    events = self.fetch_events(last_timestamp)
-                    if not events or len(events) == 0:
-                        return
-                    for event in events:
-                        detectedTime = datetime.fromtimestamp(
-                            int(event.get("timeSource"))
+            indicators = []
+            base_url = self.configuration["commandcenter_url"]
+            self.logger.info(
+                f"{PLUGIN_NAME}: Pulling indicators from {base_url} "
+            )
+            if not self.last_run_at:
+                from_time = datetime.now() - timedelta(
+                    days=int(self.configuration["days"])
+                )
+                self.logger.info(
+                    f"{PLUGIN_NAME}: will run for the first time"
+                    + f" and pull events from: {str(from_time)}"
+                )
+            else:
+                from_time = self.last_run_at
+                self.logger.info(
+                    f"{PLUGIN_NAME}: Pulling events"
+                    + f" from timestamp: {str(from_time)}"
+                )
+            events = self.fetch_events(from_time)
+            if events and len(events) > 0:
+                for event in events:
+                    detectedTime = datetime.fromtimestamp(
+                        int(event.get("timeSource"))
+                    )
+                    event_desc = event.get("description", "")
+                    event_code = event.get("eventCodeString")
+                    re_extended_info = ANOMALOUS_EVENTCODE_STRINGS[
+                        event_code
+                    ].get("extended_info")
+                    re_comments = ANOMALOUS_EVENTCODE_STRINGS[event_code].get(
+                        "comments"
+                    )
+                    if len(re_extended_info.findall(event_desc)) > 0:
+                        self.logger.info(
+                            f"re_extended_info.findall(event_desc):"
+                            + f"{re_extended_info.findall(event_desc)}"
                         )
-                        indicators.append(
-                            Indicator(
-                                value=event.get("client_hostname"),
-                                type=IndicatorType.URL,
-                                firstSeen=detectedTime,
-                                lastSeen=detectedTime,
-                                severity=COMMVAULT_TO_NETSCOPE_SEVERITY.get(
-                                    event.get("severity"), -1),
-                                tags=[],
-                                comments=self.striphtml(event.get("description", "")),
-                            )
+                        extended_info = (
+                            re_extended_info.findall(event_desc)[0]
+                            .strip()
+                            .strip('"')
+                            .strip('"')
                         )
-                    if events and len(events) != 0:
-                        last_timestamp = events[-1].get("timeSource")
-                    break
-                except Exception as e:
-                    self.logger.error(
-                        f"Exception while pulling indicators: "
-                        + f"{str(e)}, Retrying, attempt = {retry}"
+                    else:
+                        extended_info = ""
+                    comments = re_comments.sub(
+                        "", event.get("description", "")
+                    )
+                    comments = " ".join(comments.split())
+                    comments = re.sub('Please click here for more details.',
+                                      '', comments, flags=re.I)
+                    indicators.append(
+                        Indicator(
+                            value=event.get("client_hostname"),
+                            type=IndicatorType.URL,
+                            firstSeen=detectedTime,
+                            lastSeen=detectedTime,
+                            severity=COMMVAULT_TO_NETSCOPE_SEVERITY.get(
+                                event.get("severity"), -1
+                            ),
+                            tags=[],
+                            comments=comments,
+                            extendedInformation=extended_info,
+                        )
                     )
 
-            # self.storage["last_timestamp"] = last_timestamp
         except Exception as err:
             self.logger.error(
                 (
@@ -291,8 +336,8 @@ class CommVaultPlugin(PluginBase):
 
             action_dict = action_dict.get("parameters", {})
             self.logger.info(
-                f"{PLUGIN_NAME}: Pushing indicators started at:" +
-                f"{str(datetime.now())}"
+                f"{PLUGIN_NAME}: Pushing indicators started at:"
+                + f"{str(datetime.now())}"
             )
             # build the body
             alerts = []
@@ -300,13 +345,13 @@ class CommVaultPlugin(PluginBase):
                 if indicator.type == IndicatorType.MD5:
                     alerts.append(dict(indicator))
                 self.logger.info(
-                    f"{PLUGIN_NAME}: Received alert from Cloud Exchange: " +
-                    f"{str(indicator)}"
+                    f"{PLUGIN_NAME}: Received alert from Cloud Exchange: "
+                    + f"{str(indicator)}"
                 )
         except Exception as e:
             return PushResult(
                 success=False,
-                message=f"Could not push to Commvault. Exception: {str(e)}.",
+                message=f"Could not push to CommVault. Exception: {str(e)}.",
             )
 
         return PushResult(
@@ -316,36 +361,37 @@ class CommVaultPlugin(PluginBase):
 
     def _get_headers(self) -> dict:
         """Get common headers."""
-        return {
+        headers = {
             "AuthToken": self.configuration["auth_token"],
             "Accept": "application/json",
         }
+        return headers
 
     def validate(self, configuration):
         """Validate the configuration."""
-        #self.logger.info(f"Configuration: {configuration}")
         if (
-            "webservice_url" not in configuration
-            or not configuration["webservice_url"].strip()
+            "commandcenter_url" not in configuration
+            or not configuration["commandcenter_url"].strip()
         ):
             self.logger.error(
-                f"{PLUGIN_NAME}: No webservice_url key found in the"
-                " configuration parameters."
+                f"{PLUGIN_NAME}: No commandcenter_url key found in the"
+                f" configuration parameters."
             )
             return ValidationResult(
                 success=False,
                 message=(
-                    "Webservice URL can not be empty. Supplied Webservice URL:"
-                    f" {configuration['webservice_url']}"
+                    f"Command Center URL can not be empty."
+                    + f" Supplied Command Center URL:"
+                    f" {configuration['commandcenter_url']}"
                 ),
             )
-        if not self._validate_url(configuration["webservice_url"]):
+        if not self._validate_url(configuration["commandcenter_url"]):
             self.logger.error(
-                f"{PLUGIN_NAME}: Invalid Webservice URL found in the"
+                f"{PLUGIN_NAME}: Invalid Command Center URL found in the"
                 " configuration parameters."
             )
             return ValidationResult(
-                success=False, message="Invalid Webservice URL provided."
+                success=False, message="Invalid Command Center URL provided."
             )
         if "auth_token" not in configuration:
             self.logger.error(
@@ -375,7 +421,7 @@ class CommVaultPlugin(PluginBase):
                 message="Invalid Number of days provided.",
             )
 
-        self.logger.debug("Reached end of validate")
+        self.logger.debug(f"{PLUGIN_NAME}: Reached end of validate")
         return self._validate_credentials(configuration)
 
     def get_actions(self):
@@ -390,10 +436,6 @@ class CommVaultPlugin(PluginBase):
                 value="add_to_virus_definition",
             ),
         ]
-
-    def striphtml(self, data):
-        p = re.compile(r'<.*?>')
-        return p.sub('', data)
 
     def validate_action(self, action: Action):
         """Validate Mimecast configuration."""
