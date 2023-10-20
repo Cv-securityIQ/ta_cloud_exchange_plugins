@@ -2,7 +2,7 @@
     "name": "CommVault",
     "id": "commvault",
     "version": "1.0.1",
-    "description": "The CommVault plugin fetches alerts with from CommVault Threat Analysis and pushes to Netskope CTE. The plugin supports sharing Indicators to CommVault via CommVault REST API..",
+    "description": "The **Commvault Security IQ** plugin shares backup anomaly insights with Netskope (Cloud Exchange) to inform organizations when suspicious behaviour and data changes are occurring within backup content using Commvault REST APIs.",
     "patch_supported": false,
     "configuration": [
         {

@@ -2,6 +2,7 @@ import requests
 from datetime import datetime, timedelta
 import traceback
 from urllib.parse import urlparse
+import json as json
 import re
 from netskope.integrations.cte.plugin_base import (
     PluginBase,
@@ -26,7 +27,10 @@ RE_DEL_HTML = re.compile(r"(<span[^>]*>(.+?)</span>)|(<.*?>)")
 RE_GET_LINK = re.compile(r"<a[^>]*href=(.+?)>.+?</a>")
 ANOMALOUS_EVENTCODE_STRINGS = {
     "7:333": {"comments": RE_DEL_HTML, "extended_info": RE_GET_LINK},
+    "14:336": {"comments": RE_DEL_HTML, "extended_info": RE_GET_LINK},
     "14:337": {"comments": RE_DEL_HTML, "extended_info": RE_GET_LINK},
+    "69:59": {"comments": RE_DEL_HTML, "extended_info": RE_GET_LINK},
+    "69:60": {"comments": RE_DEL_HTML, "extended_info": RE_GET_LINK}
 }
 
 
@@ -45,6 +49,17 @@ COMMVAULT_TO_NETSCOPE_SEVERITY = {
     10: SeverityType.CRITICAL,
 }
 
+RAISE_ANOMALY_JSON_REQUEST_STR = """{
+    "client": {
+        "hostName":"{}"
+    },
+    "anomalyDetectedBy": {
+        "vendorName":"{}",
+        "detectionTime":{},
+        "anomalyReason":"{}"
+    }
+}"""
+
 
 class CommVaultPlugin(PluginBase):
     """The CommVault plugin implementation."""
@@ -53,6 +68,14 @@ class CommVaultPlugin(PluginBase):
         parsed = urlparse(url.strip())
         flag = (parsed.scheme.strip() != "") and (parsed.netloc.strip() != "")
         return flag
+
+    def http_request(self, method, custom_message=None, *args, **kwargs):
+        if method == "GET":
+            resp = requests.get(*args, **kwargs)
+            return self.handle_status_code(resp, custom_message=custom_message)
+        if method == "POST":
+            requests.post(*args, **kwargs)
+            return self.handle_status_code(resp, custom_message=custom_message)
 
     def _validate_credentials(self, configuration: dict) -> ValidationResult:
         try:
@@ -97,7 +120,6 @@ class CommVaultPlugin(PluginBase):
         self,
         response,
         custom_message: str = None,
-        plugin: str = None,
     ):
         """Handle status code of response.
 
@@ -111,22 +133,22 @@ class CommVaultPlugin(PluginBase):
         custom_message_str = (
             (custom_message + ",") if custom_message is not None else ""
         )
+        error_str_prefix = f"{PLUGIN_NAME}: {custom_message_str}"
+
         if response.status_code == 200 or response.status_code == 201:
             try:
                 return response.json()
             except ValueError as err:
                 error = (
-                    f"{custom_message_str} Exception"
+                    f"{error_str_prefix} Exception"
                     + " occurred while parsing JSON response."
                 )
-                if plugin:
-                    error = f"{plugin}, {error}"
                 self.logger.error(error, details=traceback.format_exc())
                 raise err
         elif response.status_code == 401:
             self.logger.error(
                 (
-                    f"{plugin}, {custom_message_str} Received"
+                    f"{error_str_prefix} Received"
                     + " exit code 401, Authentication Error."
                 ),
                 details=response.text,
@@ -134,7 +156,7 @@ class CommVaultPlugin(PluginBase):
         elif response.status_code == 403:
             self.logger.error(
                 (
-                    f"{custom_message_str} {plugin},"
+                    f"{error_str_prefix},"
                     + " Received exit code 403, Forbidden Error."
                 ),
                 details=response.text,
@@ -142,7 +164,7 @@ class CommVaultPlugin(PluginBase):
         elif response.status_code == 429:
             self.logger.error(
                 (
-                    f"{custom_message_str} {plugin},"
+                    f"{error_str_prefix},"
                     + " Received exit code 429, Too many requests."
                 ),
                 details=response.text,
@@ -150,7 +172,7 @@ class CommVaultPlugin(PluginBase):
         elif response.status_code == 409:
             self.logger.error(
                 (
-                    f"{custom_message_str} {plugin},"
+                    f"{error_str_prefix},"
                     " Received exit code 409, Concurrency found while calling"
                     " the API."
                 ),
@@ -159,8 +181,7 @@ class CommVaultPlugin(PluginBase):
         elif response.status_code >= 400 and response.status_code < 500:
             self.logger.error(
                 (
-                    f"{plugin},"
-                    f" {custom_message_str} Received"
+                    f" {error_str_prefix} Received"
                     f" exit code {response.status_code}, HTTP client Error."
                 ),
                 details=response.text,
@@ -168,8 +189,7 @@ class CommVaultPlugin(PluginBase):
         elif response.status_code >= 500 and response.status_code < 600:
             self.logger.error(
                 (
-                    f"{plugin},"
-                    f" {custom_message_str} Received"
+                    f" {error_str_prefix} Received"
                     f" exit code {response.status_code}, HTTP server Error."
                 ),
                 details=response.text,
@@ -187,17 +207,14 @@ class CommVaultPlugin(PluginBase):
         }
         if from_time and isinstance(from_time, datetime):
             params["fromTime"] = str(int(from_time.timestamp()))
-        response = requests.get(
+        response = self.http_request(
+            "GET",
+            "Error occurred while pulling indicators",
             f"{base_url}/Events",
             params=params,
             headers=self._get_headers(),
             proxies=self.proxy,
             verify=self.ssl_validation,
-        )
-        response = self.handle_status_code(
-            response,
-            "Error occurred while pulling indicators",
-            PLUGIN_NAME,
         )
 
         if not response.get("commservEvents"):
@@ -226,17 +243,14 @@ class CommVaultPlugin(PluginBase):
     def get_client_hostname(self, client_id: int) -> str:
         "Get the hostname from client properties using client id"
         base_url = self.configuration["commandcenter_url"].strip().strip("/")
-        response = requests.get(
+        response = self.http_request(
+            "GET",
+            "Error occurred in get_client_hostname()",
             f"{base_url}/Client/{int(client_id)}",
             params={},
             headers=self._get_headers(),
             proxies=self.proxy,
             verify=self.ssl_validation,
-        )
-        response = self.handle_status_code(
-            response,
-            "Error occurred in get_client_hostname()",
-            PLUGIN_NAME,
         )
         hostname = ""
         try:
@@ -286,10 +300,6 @@ class CommVaultPlugin(PluginBase):
                         "comments"
                     )
                     if len(re_extended_info.findall(event_desc)) > 0:
-                        self.logger.info(
-                            f"re_extended_info.findall(event_desc):"
-                            + f"{re_extended_info.findall(event_desc)}"
-                        )
                         extended_info = (
                             re_extended_info.findall(event_desc)[0]
                             .strip()
@@ -302,8 +312,12 @@ class CommVaultPlugin(PluginBase):
                         "", event.get("description", "")
                     )
                     comments = " ".join(comments.split())
-                    comments = re.sub('Please click here for more details.',
-                                      '', comments, flags=re.I)
+                    comments = re.sub(
+                        "Please click here for more details.",
+                        "",
+                        comments,
+                        flags=re.I,
+                    )
                     indicators.append(
                         Indicator(
                             value=event.get("client_hostname"),
@@ -333,21 +347,38 @@ class CommVaultPlugin(PluginBase):
     def push(self, indicators, action_dict) -> PushResult:
         """Push indicators to CommVault."""
         try:
-
-            action_dict = action_dict.get("parameters", {})
+            base_url = (
+                self.configuration["commandcenter_url"].strip().strip("/")
+            )
             self.logger.info(
                 f"{PLUGIN_NAME}: Pushing indicators started at:"
                 + f"{str(datetime.now())}"
             )
             # build the body
-            alerts = []
             for indicator in indicators:
-                if indicator.type == IndicatorType.MD5:
-                    alerts.append(dict(indicator))
-                self.logger.info(
-                    f"{PLUGIN_NAME}: Received alert from Cloud Exchange: "
-                    + f"{str(indicator)}"
-                )
+                if action_dict.get("value") == "report_client_as_anomalous":
+                    if indicator.type == IndicatorType.URL:
+                        hostname = indicator.value
+                        vendorname = "Netskope"
+                        detection_time = indicator.lastSeen
+                        anomaly_reason = indicator.comments
+                        request_body = RAISE_ANOMALY_JSON_REQUEST_STR.format(
+                            hostname,
+                            vendorname,
+                            detection_time,
+                            anomaly_reason,
+                        )
+                        self.http_request(
+                            "POST",
+                            f"{base_url}/Client/Action/Report/Anomaly",
+                            "Error while pushing indicator",
+                            params={},
+                            data=json.dumps(request_body),
+                            headers=self._get_headers(),
+                            proxies=self.proxy,
+                            verify=self.ssl_validation,
+                        )
+
         except Exception as e:
             return PushResult(
                 success=False,
@@ -374,7 +405,7 @@ class CommVaultPlugin(PluginBase):
             or not configuration["commandcenter_url"].strip()
         ):
             self.logger.error(
-                f"{PLUGIN_NAME}: No commandcenter_url key found in the"
+                f"{PLUGIN_NAME}: No Command Center URL found in the"
                 f" configuration parameters."
             )
             return ValidationResult(
@@ -420,56 +451,31 @@ class CommVaultPlugin(PluginBase):
                 success=False,
                 message="Invalid Number of days provided.",
             )
-
-        self.logger.debug(f"{PLUGIN_NAME}: Reached end of validate")
         return self._validate_credentials(configuration)
 
     def get_actions(self):
         """Get available actions."""
         return [
             Action(
-                label="Disable data aging on subclient",
-                value="block_subclient_by_ip_address",
-            ),
-            Action(
-                label="Add to Virus Definition",
-                value="add_to_virus_definition",
-            ),
+                label="Report client as Anomalous",
+                value="report_client_as_anomalous",
+            )
         ]
+
 
     def validate_action(self, action: Action):
         """Validate Mimecast configuration."""
+
         if action.value not in [
-            "block_subclient_by_ip_address",
-            "add_to_virus_definition",
+            "report_client_as_anomalous",
         ]:
             return ValidationResult(
                 success=False, message="Unsupported action provided."
             )
 
-        if action.parameters.get("plan_name") is None:
-            return ValidationResult(
-                success=False, message="Plan Name should not be empty."
-            )
 
         return ValidationResult(success=True, message="Validation successful.")
 
     def get_action_fields(self, action: Action):
         """Get fields required for an action."""
-        if action.value in [
-            "block_subclient_by_ip_address",
-            "add_to_virus_definition",
-        ]:
-            return [
-                {
-                    "label": "Plan Name",
-                    "key": "plan_name",
-                    "type": "text",
-                    "default": "CommVault Plan Name",
-                    "mandatory": True,
-                    "description": (
-                        "Name of CommVault Data Classification Plan where"
-                        + " indicator should be pushed."
-                    ),
-                },
-            ]
+        return []
